@@ -26,7 +26,13 @@ import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
 
 import java.io.File;
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.util.Base64;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -40,44 +46,115 @@ class IggyPinotIntegrationTest {
 
     @Container
     static final DockerComposeContainer<?> environment =
-            new DockerComposeContainer<>(new File("docker-compose.yml"))
+            new DockerComposeContainer<>(new File("docker-compose.test.yml"))
                     .withExposedService(
                             "iggy",
                             IGGY_HTTP_PORT,
-                            Wait.forHttp("/").forStatusCode(200).withStartupTimeout(Duration.ofMinutes(3)))
+                            Wait.forHttp("/")
+                                    .forPort(IGGY_HTTP_PORT)
+                                    .forStatusCode(200)
+                                    .withStartupTimeout(Duration.ofMinutes(3)))
                     .withExposedService(
                             "pinot-controller",
                             PINOT_CONTROLLER_PORT,
-                            Wait.forHttp("/health").forStatusCode(200).withStartupTimeout(Duration.ofMinutes(3)))
+                            Wait.forHttp("/health")
+                                    .forPort(PINOT_CONTROLLER_PORT)
+                                    .forStatusCode(200)
+                                    .withStartupTimeout(Duration.ofMinutes(3)))
                     .withExposedService(
                             "pinot-broker",
                             PINOT_BROKER_PORT,
-                            Wait.forHttp("/health").forStatusCode(200).withStartupTimeout(Duration.ofMinutes(3)))
+                            Wait.forHttp("/health")
+                                    .forPort(PINOT_BROKER_PORT)
+                                    .forStatusCode(200)
+                                    .withStartupTimeout(Duration.ofMinutes(3)))
                     .withExposedService(
                             "pinot-server",
                             PINOT_SERVER_ADMIN_PORT,
-                            Wait.forHttp("/health").forStatusCode(200).withStartupTimeout(Duration.ofMinutes(3)))
-                    .withLocalCompose(true);
+                            Wait.forHttp("/health")
+                                    .forPort(PINOT_SERVER_ADMIN_PORT)
+                                    .forStatusCode(200)
+                                    .withStartupTimeout(Duration.ofMinutes(3)));
 
     @Test
     void servicesAreRunning() {
-        assertThat(environment.isRunning()).isTrue();
+        HttpClient client = HttpClient.newBuilder()
+                .connectTimeout(Duration.ofSeconds(10))
+                .build();
+
+        String iggyUrl = baseUrl("iggy", IGGY_HTTP_PORT);
+        String controllerUrl = baseUrl("pinot-controller", PINOT_CONTROLLER_PORT);
+        String brokerUrl = baseUrl("pinot-broker", PINOT_BROKER_PORT);
+        String serverUrl = baseUrl("pinot-server", PINOT_SERVER_ADMIN_PORT);
+
+        assertThat(httpStatus(client, iggyUrl + "/")).isEqualTo(200);
+        assertThat(httpStatus(client, controllerUrl + "/health")).isEqualTo(200);
+        assertThat(httpStatus(client, brokerUrl + "/health")).isEqualTo(200);
+        assertThat(httpStatus(client, serverUrl + "/health")).isEqualTo(200);
     }
 
-    static String iggyHttpBaseUrl() {
-        return baseUrl("iggy", IGGY_HTTP_PORT);
-    }
+    @Test
+    void sendMessagesToIggy() throws Exception {
+        HttpClient client = HttpClient.newBuilder()
+                .connectTimeout(Duration.ofSeconds(10))
+                .build();
 
-    static String pinotControllerBaseUrl() {
-        return baseUrl("pinot-controller", PINOT_CONTROLLER_PORT);
-    }
+        String iggyUrl = baseUrl("iggy", IGGY_HTTP_PORT);
+        HttpResponse<String> loginResponse = postJson(
+                client,
+                iggyUrl + "/users/login",
+                "{\"username\":\"iggy\",\"password\":\"iggy\"}",
+                null);
+        assertThat(loginResponse.statusCode()).isBetween(200, 299);
 
-    static String pinotBrokerBaseUrl() {
-        return baseUrl("pinot-broker", PINOT_BROKER_PORT);
-    }
+        String token = loginResponse.body()
+                .split("\"token\":\"")[1]
+                .split("\"")[0];
+        assertThat(token).isNotBlank();
 
-    static String pinotServerAdminBaseUrl() {
-        return baseUrl("pinot-server", PINOT_SERVER_ADMIN_PORT);
+        HttpResponse<String> streamResponse = postJson(
+                client,
+                iggyUrl + "/streams",
+                "{\"stream_id\":1,\"name\":\"test-stream\"}",
+                token);
+        assertThat(streamResponse.statusCode()).isBetween(200, 299);
+
+        HttpResponse<String> topicResponse = postJson(
+                client,
+                iggyUrl + "/streams/test-stream/topics",
+                "{\"topic_id\":1,\"name\":\"test-events\",\"partitions_count\":2,"
+                        + "\"compression_algorithm\":\"none\",\"message_expiry\":0,\"max_topic_size\":0}",
+                token);
+        assertThat(topicResponse.statusCode()).isBetween(200, 299);
+
+        HttpResponse<String> groupResponse = postJson(
+                client,
+                iggyUrl + "/streams/test-stream/topics/test-events/consumer-groups",
+                "{\"name\":\"pinot-integration-test\"}",
+                token);
+        assertThat(groupResponse.statusCode()).isBetween(200, 299);
+
+        String partitionValue = Base64.getEncoder().encodeToString(new byte[] {0, 0, 0, 0});
+        for (int i = 1; i <= 10; i++) {
+            long timestamp = System.currentTimeMillis();
+            String payloadJson = "{"
+                    + "\"userId\":\"user" + i + "\","
+                    + "\"eventType\":\"test_event\","
+                    + "\"deviceType\":\"desktop\","
+                    + "\"duration\":" + (i * 100) + ","
+                    + "\"timestamp\":" + timestamp
+                    + "}";
+            String payload = Base64.getEncoder()
+                    .encodeToString(payloadJson.getBytes(StandardCharsets.UTF_8));
+            String body = "{\"partitioning\":{\"kind\":\"partition_id\",\"value\":\"" + partitionValue + "\"},"
+                    + "\"messages\":[{\"payload\":\"" + payload + "\"}]}";
+            HttpResponse<String> sendResponse = postJson(
+                    client,
+                    iggyUrl + "/streams/test-stream/topics/test-events/messages",
+                    body,
+                    token);
+            assertThat(sendResponse.statusCode()).isBetween(200, 299);
+        }
     }
 
     private static String baseUrl(String service, int port) {
@@ -85,4 +162,35 @@ class IggyPinotIntegrationTest {
         Integer mappedPort = environment.getServicePort(service, port);
         return "http://" + host + ":" + mappedPort;
     }
+
+    private static int httpStatus(HttpClient client, String url) {
+        try {
+            HttpRequest request = HttpRequest.newBuilder()
+                    .uri(URI.create(url))
+                    .timeout(Duration.ofSeconds(10))
+                    .GET()
+                    .build();
+            HttpResponse<Void> response = client.send(request, HttpResponse.BodyHandlers.discarding());
+            return response.statusCode();
+        } catch (Exception e) {
+            throw new RuntimeException("HTTP request failed for " + url, e);
+        }
+    }
+
+    private static HttpResponse<String> postJson(
+            HttpClient client,
+            String url,
+            String json,
+            String token) throws Exception {
+        HttpRequest.Builder builder = HttpRequest.newBuilder()
+                .uri(URI.create(url))
+                .timeout(Duration.ofSeconds(15))
+                .header("Content-Type", "application/json")
+                .POST(HttpRequest.BodyPublishers.ofString(json, StandardCharsets.UTF_8));
+        if (token != null) {
+            builder.header("Authorization", "Bearer " + token);
+        }
+        return client.send(builder.build(), HttpResponse.BodyHandlers.ofString());
+    }
+
 }
