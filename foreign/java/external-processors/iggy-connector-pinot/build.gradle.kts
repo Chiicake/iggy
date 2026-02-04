@@ -42,6 +42,8 @@ dependencies {
     // Testing
     testImplementation(platform(libs.junit.bom))
     testImplementation(libs.bundles.testing)
+    testImplementation(libs.testcontainers)
+    testImplementation(libs.testcontainers.junit)
     testImplementation(libs.pinot.spi) // Need Pinot SPI for tests
     testRuntimeOnly(libs.slf4j.simple)
 }
@@ -55,6 +57,10 @@ tasks.register<Copy>("copyDependencies") {
 // Make jar task depend on copyDependencies
 tasks.named("jar") {
     finalizedBy("copyDependencies")
+}
+
+tasks.named("test") {
+    dependsOn(":iggy-connector-pinot:jar", ":iggy:jar")
 }
 
 publishing {
