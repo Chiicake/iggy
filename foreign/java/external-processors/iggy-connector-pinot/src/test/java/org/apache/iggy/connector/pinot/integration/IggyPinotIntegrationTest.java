@@ -40,6 +40,8 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.Base64;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -53,6 +55,9 @@ class IggyPinotIntegrationTest {
     private static final int PINOT_BROKER_PORT = 8099;
     private static final int PINOT_SERVER_ADMIN_PORT = 8097;
     private static final Duration REQUEST_TIMEOUT = Duration.ofSeconds(30);
+    private static final Duration INGESTION_TIMEOUT = Duration.ofMinutes(2);
+    private static final Duration POLL_INTERVAL = Duration.ofSeconds(2);
+    private static final Pattern COUNT_PATTERN = Pattern.compile("\"rows\"\\s*:\\s*\\[\\s*\\[\\s*(\\d+)");
 
     private static HttpClient client;
     private static String iggyUrl;
@@ -102,6 +107,7 @@ class IggyPinotIntegrationTest {
     static void init() {
         client = HttpClient.newBuilder()
                 .connectTimeout(Duration.ofSeconds(10))
+                .version(HttpClient.Version.HTTP_1_1)
                 .build();
         iggyUrl = baseUrl("iggy", IGGY_HTTP_PORT);
         controllerUrl = baseUrl("pinot-controller", PINOT_CONTROLLER_PORT);
@@ -135,7 +141,7 @@ class IggyPinotIntegrationTest {
         System.out.println("Login response: " + loginResponse.statusCode());
         System.out.println(loginResponse.body());
         assertThat(loginResponse.statusCode()).isBetween(200, 299);
-        token = loginResponse.body().split("\"token\":\"")[1].split("\"")[0];
+        token = extractToken(loginResponse.body());
         assertThat(token).isNotBlank();
     }
 
@@ -246,7 +252,7 @@ class IggyPinotIntegrationTest {
     void step9_pollPinotForIngestion() throws Exception {
         System.out.println("Step 9: Poll Pinot for ingestion");
         String queryBody = "{\"sql\":\"SELECT COUNT(*) FROM test_events_REALTIME\"}";
-        long deadline = System.currentTimeMillis() + Duration.ofSeconds(60).toMillis();
+        long deadline = System.currentTimeMillis() + INGESTION_TIMEOUT.toMillis();
         long count = -1;
 
         while (System.currentTimeMillis() < deadline) {
@@ -254,28 +260,12 @@ class IggyPinotIntegrationTest {
             System.out.println("Query response: " + response.statusCode());
             System.out.println(response.body());
             if (response.statusCode() >= 200 && response.statusCode() < 300) {
-                String body = response.body();
-                if (body.contains("\"resultTable\"")) {
-                    String marker = "\"rows\":[[";
-                    int start = body.indexOf(marker);
-                    if (start > 0) {
-                        int from = start + marker.length();
-                        int to = body.indexOf("]", from);
-                        if (to > from) {
-                            String value = body.substring(from, to).trim();
-                            try {
-                                count = Long.parseLong(value);
-                            } catch (NumberFormatException ignored) {
-                                count = -1;
-                            }
-                            if (count > 0) {
-                                break;
-                            }
-                        }
-                    }
+                count = extractCount(response.body());
+                if (count > 0) {
+                    break;
                 }
             }
-            Thread.sleep(2000);
+            Thread.sleep(POLL_INTERVAL.toMillis());
         }
 
         assertThat(count)
@@ -320,15 +310,64 @@ class IggyPinotIntegrationTest {
             String url,
             String json,
             String token) throws Exception {
-        HttpRequest.Builder builder = HttpRequest.newBuilder()
-                .uri(URI.create(url))
-                .timeout(REQUEST_TIMEOUT)
-                .header("Content-Type", "application/json")
-                .POST(HttpRequest.BodyPublishers.ofString(json, StandardCharsets.UTF_8));
-        if (token != null) {
-            builder.header("Authorization", "Bearer " + token);
+        int maxAttempts = 3;
+        byte[] body = json.getBytes(StandardCharsets.UTF_8);
+        for (int attempt = 1; attempt <= maxAttempts; attempt++) {
+            try {
+                HttpRequest.Builder builder = HttpRequest.newBuilder()
+                        .uri(URI.create(url))
+                        .timeout(REQUEST_TIMEOUT)
+                        .header("Accept", "*/*")
+                        .header("Content-Type", "application/json")
+                        .POST(HttpRequest.BodyPublishers.ofByteArray(body));
+                if (token != null) {
+                    builder.header("Authorization", "Bearer " + token);
+                }
+                HttpResponse<String> response = client.send(builder.build(), HttpResponse.BodyHandlers.ofString());
+                if (!shouldRetry(response.statusCode()) || attempt == maxAttempts) {
+                    return response;
+                }
+                System.out.println("Request failed with status " + response.statusCode() + ", retrying...");
+            } catch (IOException | InterruptedException e) {
+                if (e instanceof InterruptedException) {
+                    Thread.currentThread().interrupt();
+                }
+                if (attempt == maxAttempts) {
+                    throw e;
+                }
+                System.out.println("Request error: " + e.getMessage() + ", retrying...");
+            }
+            Thread.sleep(2000);
         }
-        return client.send(builder.build(), HttpResponse.BodyHandlers.ofString());
+        throw new IllegalStateException("Request retries exhausted");
     }
 
+    private static boolean shouldRetry(int status) {
+        return status == 408 || status == 429 || status >= 500;
+    }
+
+    private static String extractToken(String body) {
+        int idx = body.indexOf("\"token\":\"");
+        if (idx < 0) {
+            throw new IllegalStateException("Token not found in login response");
+        }
+        int start = idx + "\"token\":\"".length();
+        int end = body.indexOf("\"", start);
+        if (end < 0) {
+            throw new IllegalStateException("Token not terminated in login response");
+        }
+        return body.substring(start, end);
+    }
+
+    private static long extractCount(String body) {
+        Matcher matcher = COUNT_PATTERN.matcher(body);
+        if (!matcher.find()) {
+            return -1;
+        }
+        try {
+            return Long.parseLong(matcher.group(1));
+        } catch (NumberFormatException ignored) {
+            return -1;
+        }
+    }
 }
