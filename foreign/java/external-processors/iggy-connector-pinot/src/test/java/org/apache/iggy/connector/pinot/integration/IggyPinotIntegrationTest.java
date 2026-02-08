@@ -38,8 +38,10 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Base64;
+import java.util.List;
 import java.util.Optional;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -59,8 +61,11 @@ class IggyPinotIntegrationTest {
     private static final String SERVICE_PINOT_BROKER = "pinot-broker";
     private static final String SERVICE_PINOT_SERVER = "pinot-server";
     private static final Duration INGESTION_TIMEOUT = Duration.ofMinutes(2);
+    private static final Duration BULK_INGESTION_TIMEOUT = Duration.ofMinutes(3);
     private static final Duration POLL_INTERVAL = Duration.ofSeconds(2);
     private static final int MESSAGES_TO_SEND = 10;
+    private static final int BULK_MESSAGES_TO_SEND = 120;
+    private static final int BULK_BATCH_SIZE = 20;
     private static final int LOG_TAIL_LINES = 80;
     private static final int REQUEST_MAX_ATTEMPTS = 3;
     private static final Duration REQUEST_RETRY_DELAY = Duration.ofSeconds(2);
@@ -223,26 +228,10 @@ class IggyPinotIntegrationTest {
     @Order(9)
     void step9_sendMessages() {
         System.out.println("Step 9: Send messages");
-        String partitionValue = Base64.getEncoder().encodeToString(new byte[] {0, 0, 0, 0});
         for (int i = 1; i <= MESSAGES_TO_SEND; i++) {
             long timestamp = System.currentTimeMillis();
-            String payloadJson = "{"
-                    + "\"userId\":\"user" + i + "\","
-                    + "\"eventType\":\"test_event\","
-                    + "\"deviceType\":\"desktop\","
-                    + "\"duration\":" + (i * 100) + ","
-                    + "\"timestamp\":" + timestamp
-                    + "}";
-            String payload = Base64.getEncoder().encodeToString(payloadJson.getBytes(StandardCharsets.UTF_8));
-            String body = "{\"partitioning\":{\"kind\":\"partition_id\",\"value\":\"" + partitionValue + "\"},"
-                    + "\"messages\":[{\"payload\":\"" + payload + "\"}]}";
-            Response sendResponse = postJson(
-                    iggyUrl + "/streams/test-stream/topics/test-events/messages",
-                    body,
-                    token);
-            System.out.println("Send message " + i + " response: " + sendResponse.statusCode());
-            System.out.println(sendResponse.asString());
-            assertSuccessful(sendResponse, "Send message " + i);
+            String payloadJson = eventPayloadJson("user" + i, "test_event", "desktop", i * 100L, timestamp);
+            sendEventPayloads(List.of(payloadJson), "Send message " + i);
         }
     }
 
@@ -250,33 +239,77 @@ class IggyPinotIntegrationTest {
     @Order(10)
     void step10_pollPinotForIngestion() {
         System.out.println("Step 10: Poll Pinot for ingestion");
-        String queryBody = "{\"sql\":\"SELECT COUNT(*) FROM test_events_REALTIME\"}";
-        long deadline = System.currentTimeMillis() + INGESTION_TIMEOUT.toMillis();
-        long count = -1;
-        int lastStatus = -1;
-        String lastQueryResponse = "";
+        long count = waitForCountAtLeast(MESSAGES_TO_SEND, INGESTION_TIMEOUT);
+        assertThat(count)
+                .withFailMessage("Expected at least %s rows after initial ingestion, but got %s", MESSAGES_TO_SEND, count)
+                .isGreaterThanOrEqualTo(MESSAGES_TO_SEND);
+    }
 
-        while (System.currentTimeMillis() < deadline) {
-            Response response = postJson(brokerUrl + "/query/sql", queryBody, null);
-            lastStatus = response.statusCode();
-            lastQueryResponse = response.asString();
-            System.out.println("Query response: " + lastStatus);
-            System.out.println(lastQueryResponse);
-            if (lastStatus >= 200 && lastStatus < 300) {
-                count = extractCount(response);
-                if (count >= MESSAGES_TO_SEND) {
-                    return;
-                }
+    @Test
+    @Order(11)
+    void step11_validateJsonParsingAndSchemaMapping() {
+        System.out.println("Step 11: Validate JSON parsing and schema mapping");
+        String userId = "schema-user-" + System.currentTimeMillis();
+        long expectedDuration = 4242L;
+        long expectedTimestamp = System.currentTimeMillis();
+        String payloadJson = eventPayloadJson(userId, "schema_event", "mobile", expectedDuration, expectedTimestamp);
+        sendEventPayloads(List.of(payloadJson), "Send schema mapping test message");
+
+        String sql = "SELECT * FROM test_events_REALTIME WHERE userId = '" + userId + "' LIMIT 1";
+        Response response = waitForQueryRow(sql, INGESTION_TIMEOUT);
+        List<String> columnNames = response.jsonPath().getList("resultTable.dataSchema.columnNames");
+        List<Object> row = response.jsonPath().getList("resultTable.rows[0]");
+        int userIdIndex = columnIndex(columnNames, "userId");
+        int eventTypeIndex = columnIndex(columnNames, "eventType");
+        int deviceTypeIndex = columnIndex(columnNames, "deviceType");
+        int durationIndex = columnIndex(columnNames, "duration");
+        int timestampIndex = columnIndex(columnNames, "timestamp");
+
+        assertThat(row)
+                .withFailMessage("Expected one matching row for userId=%s, response=%s", userId, response.asString())
+                .hasSizeGreaterThan(Math.max(timestampIndex, Math.max(userIdIndex, durationIndex)));
+        assertThat(String.valueOf(row.get(userIdIndex))).isEqualTo(userId);
+        assertThat(String.valueOf(row.get(eventTypeIndex))).isEqualTo("schema_event");
+        assertThat(String.valueOf(row.get(deviceTypeIndex))).isEqualTo("mobile");
+        assertThat(toLong(row.get(durationIndex))).isEqualTo(expectedDuration);
+        assertThat(toLong(row.get(timestampIndex))).isEqualTo(expectedTimestamp);
+    }
+
+    @Test
+    @Order(12)
+    void step12_bulkMessageIngestion() {
+        System.out.println("Step 12: Bulk message ingestion");
+        long baselineCount = fetchCurrentCount();
+        String userPrefix = "bulk-user-" + System.currentTimeMillis() + "-";
+
+        int sent = 0;
+        while (sent < BULK_MESSAGES_TO_SEND) {
+            int batchSize = Math.min(BULK_BATCH_SIZE, BULK_MESSAGES_TO_SEND - sent);
+            List<String> batchPayloads = new ArrayList<>(batchSize);
+            for (int i = 0; i < batchSize; i++) {
+                int index = sent + i;
+                batchPayloads.add(
+                        eventPayloadJson(
+                                userPrefix + index,
+                                "bulk_event",
+                                "mobile",
+                                1000L + index,
+                                System.currentTimeMillis()));
             }
-            sleepWithInterruptHandling(POLL_INTERVAL.toMillis());
+            int batchNumber = (sent / BULK_BATCH_SIZE) + 1;
+            sendEventPayloads(batchPayloads, "Send bulk batch " + batchNumber + " (" + batchSize + " messages)");
+            sent += batchSize;
         }
 
-        throw new AssertionError(
-                "Expected at least " + MESSAGES_TO_SEND + " ingested rows, but got " + count
-                        + ", lastStatus=" + lastStatus
-                        + ", lastQueryResponse=" + lastQueryResponse
-                        + System.lineSeparator()
-                        + diagnosticLogs());
+        long expectedCount = baselineCount + BULK_MESSAGES_TO_SEND;
+        long finalCount = waitForCountAtLeast(expectedCount, BULK_INGESTION_TIMEOUT);
+        assertThat(finalCount)
+                .withFailMessage(
+                        "Bulk ingestion expected at least %s rows, baseline=%s, final=%s",
+                        expectedCount,
+                        baselineCount,
+                        finalCount)
+                .isGreaterThanOrEqualTo(expectedCount);
     }
 
     private static String baseUrl(String service, int port) {
@@ -352,6 +385,136 @@ class IggyPinotIntegrationTest {
                 .isBetween(200, 299);
     }
 
+    private static long waitForCountAtLeast(long expectedCount, Duration timeout) {
+        String queryBody = "{\"sql\":\"SELECT COUNT(*) FROM test_events_REALTIME\"}";
+        long deadline = System.currentTimeMillis() + timeout.toMillis();
+        long count = -1;
+        int lastStatus = -1;
+        String lastQueryResponse = "";
+
+        while (System.currentTimeMillis() < deadline) {
+            Response response = postJson(brokerUrl + "/query/sql", queryBody, null);
+            lastStatus = response.statusCode();
+            lastQueryResponse = response.asString();
+            System.out.println("Count query response: " + lastStatus);
+            System.out.println(lastQueryResponse);
+            if (lastStatus >= 200 && lastStatus < 300) {
+                count = extractCount(response);
+                if (count >= expectedCount) {
+                    return count;
+                }
+            }
+            sleepWithInterruptHandling(POLL_INTERVAL.toMillis());
+        }
+
+        throw new AssertionError(
+                "Expected at least " + expectedCount + " ingested rows, but got " + count
+                        + ", lastStatus=" + lastStatus
+                        + ", lastQueryResponse=" + lastQueryResponse
+                        + System.lineSeparator()
+                        + diagnosticLogs());
+    }
+
+    private static long fetchCurrentCount() {
+        String queryBody = "{\"sql\":\"SELECT COUNT(*) FROM test_events_REALTIME\"}";
+        Response response = postJson(brokerUrl + "/query/sql", queryBody, null);
+        assertSuccessful(response, "Fetch current row count");
+        return extractCount(response);
+    }
+
+    private static Response waitForQueryRow(String sql, Duration timeout) {
+        String queryBody = queryBody(sql);
+        long deadline = System.currentTimeMillis() + timeout.toMillis();
+        int lastStatus = -1;
+        String lastBody = "";
+
+        while (System.currentTimeMillis() < deadline) {
+            Response response = postJson(brokerUrl + "/query/sql", queryBody, null);
+            lastStatus = response.statusCode();
+            lastBody = response.asString();
+            if (lastStatus >= 200 && lastStatus < 300) {
+                List<?> exceptions = response.jsonPath().getList("exceptions");
+                if (exceptions != null && !exceptions.isEmpty()) {
+                    throw new AssertionError(
+                            "Query returned parsing/execution errors. sql=" + sql
+                                    + ", response=" + response.asString()
+                                    + System.lineSeparator()
+                                    + diagnosticLogs());
+                }
+                List<?> rows = response.jsonPath().getList("resultTable.rows");
+                if (rows != null && !rows.isEmpty()) {
+                    return response;
+                }
+            }
+            sleepWithInterruptHandling(POLL_INTERVAL.toMillis());
+        }
+
+        throw new AssertionError(
+                "Query did not return rows in time. sql=" + sql
+                        + ", lastStatus=" + lastStatus
+                        + ", lastBody=" + lastBody
+                        + System.lineSeparator()
+                        + diagnosticLogs());
+    }
+
+    private static int columnIndex(List<String> columnNames, String columnName) {
+        assertThat(columnNames)
+                .withFailMessage("Column names missing in query response while resolving %s", columnName)
+                .isNotNull();
+        int index = columnNames.indexOf(columnName);
+        assertThat(index)
+                .withFailMessage("Column %s not found in Pinot response columns=%s", columnName, columnNames)
+                .isGreaterThanOrEqualTo(0);
+        return index;
+    }
+
+    private static String queryBody(String sql) {
+        return "{\"sql\":\"" + escapeJson(sql) + "\"}";
+    }
+
+    private static String escapeJson(String raw) {
+        return raw.replace("\\", "\\\\")
+                .replace("\"", "\\\"");
+    }
+
+    private static String eventPayloadJson(
+            String userId,
+            String eventType,
+            String deviceType,
+            long duration,
+            long timestamp) {
+        return "{"
+                + "\"userId\":\"" + userId + "\","
+                + "\"eventType\":\"" + eventType + "\","
+                + "\"deviceType\":\"" + deviceType + "\","
+                + "\"duration\":" + duration + ","
+                + "\"timestamp\":" + timestamp
+                + "}";
+    }
+
+    private static void sendEventPayloads(List<String> payloadJsonMessages, String action) {
+        String partitionValue = Base64.getEncoder().encodeToString(new byte[] {0, 0, 0, 0});
+        StringBuilder messages = new StringBuilder();
+        for (int i = 0; i < payloadJsonMessages.size(); i++) {
+            if (i > 0) {
+                messages.append(",");
+            }
+            String payload = Base64.getEncoder()
+                    .encodeToString(payloadJsonMessages.get(i).getBytes(StandardCharsets.UTF_8));
+            messages.append("{\"payload\":\"").append(payload).append("\"}");
+        }
+
+        String body = "{\"partitioning\":{\"kind\":\"partition_id\",\"value\":\"" + partitionValue + "\"},"
+                + "\"messages\":[" + messages + "]}";
+        Response sendResponse = postJson(
+                iggyUrl + "/streams/test-stream/topics/test-events/messages",
+                body,
+                token);
+        System.out.println(action + " response: " + sendResponse.statusCode());
+        System.out.println(sendResponse.asString());
+        assertSuccessful(sendResponse, action);
+    }
+
     private static void assertTenantAdded(String role) throws Exception {
         org.testcontainers.containers.Container.ExecResult result = findContainer(SERVICE_PINOT_CONTROLLER)
                 .execInContainer(
@@ -416,6 +579,10 @@ class IggyPinotIntegrationTest {
 
     private static long extractCount(Response response) {
         Object value = response.jsonPath().get("resultTable.rows[0][0]");
+        return toLong(value);
+    }
+
+    private static long toLong(Object value) {
         if (value instanceof Number) {
             return ((Number) value).longValue();
         }
