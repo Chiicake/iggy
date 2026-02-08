@@ -45,6 +45,7 @@ dependencies {
     testImplementation(libs.testcontainers)
     testImplementation(libs.testcontainers.junit)
     testImplementation(libs.pinot.spi) // Need Pinot SPI for tests
+    testImplementation(libs.restassured)
     testRuntimeOnly(libs.slf4j.simple)
 }
 

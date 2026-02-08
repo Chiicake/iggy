@@ -19,11 +19,8 @@
 
 package org.apache.iggy.connector.pinot.integration;
 
-import dev.failsafe.Failsafe;
-import dev.failsafe.RetryPolicy;
 import io.restassured.RestAssured;
 import io.restassured.response.Response;
-import org.awaitility.core.ConditionTimeoutException;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.MethodOrderer;
 import org.junit.jupiter.api.Order;
@@ -44,12 +41,8 @@ import java.time.Duration;
 import java.util.Arrays;
 import java.util.Base64;
 import java.util.Optional;
-import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.AtomicLong;
-import java.util.concurrent.atomic.AtomicReference;
 
 import static org.assertj.core.api.Assertions.assertThat;
-import static org.awaitility.Awaitility.await;
 
 @Testcontainers
 @TestMethodOrder(MethodOrderer.OrderAnnotation.class)
@@ -69,12 +62,8 @@ class IggyPinotIntegrationTest {
     private static final Duration POLL_INTERVAL = Duration.ofSeconds(2);
     private static final int MESSAGES_TO_SEND = 10;
     private static final int LOG_TAIL_LINES = 80;
-    private static final RetryPolicy<Response> RETRY_POLICY = RetryPolicy.<Response>builder()
-            .handle(RuntimeException.class)
-            .handleResultIf(response -> response.statusCode() < 200 || response.statusCode() > 300)
-            .withDelay(Duration.ofSeconds(2))
-            .withMaxAttempts(3)
-            .build();
+    private static final int REQUEST_MAX_ATTEMPTS = 3;
+    private static final Duration REQUEST_RETRY_DELAY = Duration.ofSeconds(2);
 
     private static String iggyUrl;
     private static String controllerUrl;
@@ -262,35 +251,32 @@ class IggyPinotIntegrationTest {
     void step10_pollPinotForIngestion() {
         System.out.println("Step 10: Poll Pinot for ingestion");
         String queryBody = "{\"sql\":\"SELECT COUNT(*) FROM test_events_REALTIME\"}";
-        AtomicLong count = new AtomicLong(-1);
-        AtomicInteger lastStatus = new AtomicInteger(-1);
-        AtomicReference<String> lastQueryResponse = new AtomicReference<>("");
+        long deadline = System.currentTimeMillis() + INGESTION_TIMEOUT.toMillis();
+        long count = -1;
+        int lastStatus = -1;
+        String lastQueryResponse = "";
 
-        try {
-            await()
-                    .atMost(INGESTION_TIMEOUT)
-                    .pollInterval(POLL_INTERVAL)
-                    .until(() -> {
-                        Response response = postJson(brokerUrl + "/query/sql", queryBody, null);
-                        lastStatus.set(response.statusCode());
-                        String body = response.asString();
-                        lastQueryResponse.set(body);
-                        System.out.println("Query response: " + response.statusCode());
-                        System.out.println(body);
-                        if (response.statusCode() >= 200 && response.statusCode() < 300) {
-                            count.set(extractCount(response));
-                        }
-                        return count.get() >= MESSAGES_TO_SEND;
-                    });
-        } catch (ConditionTimeoutException e) {
-            throw new AssertionError(
-                    "Expected at least " + MESSAGES_TO_SEND + " ingested rows, but got " + count.get()
-                            + ", lastStatus=" + lastStatus.get()
-                            + ", lastQueryResponse=" + lastQueryResponse.get()
-                            + System.lineSeparator()
-                            + diagnosticLogs(),
-                    e);
+        while (System.currentTimeMillis() < deadline) {
+            Response response = postJson(brokerUrl + "/query/sql", queryBody, null);
+            lastStatus = response.statusCode();
+            lastQueryResponse = response.asString();
+            System.out.println("Query response: " + lastStatus);
+            System.out.println(lastQueryResponse);
+            if (lastStatus >= 200 && lastStatus < 300) {
+                count = extractCount(response);
+                if (count >= MESSAGES_TO_SEND) {
+                    return;
+                }
+            }
+            sleepWithInterruptHandling(POLL_INTERVAL.toMillis());
         }
+
+        throw new AssertionError(
+                "Expected at least " + MESSAGES_TO_SEND + " ingested rows, but got " + count
+                        + ", lastStatus=" + lastStatus
+                        + ", lastQueryResponse=" + lastQueryResponse
+                        + System.lineSeparator()
+                        + diagnosticLogs());
     }
 
     private static String baseUrl(String service, int port) {
@@ -320,19 +306,44 @@ class IggyPinotIntegrationTest {
     }
 
     private static Response postJson(String url, String json, String token) {
-        return Failsafe.with(RETRY_POLICY).get(() -> {
-            io.restassured.specification.RequestSpecification request = RestAssured.given()
-                    .accept("*/*")
-                    .contentType("application/json")
-                    .body(json);
-            if (token != null) {
-                request.header("Authorization", "Bearer " + token);
+        for (int attempt = 1; attempt <= REQUEST_MAX_ATTEMPTS; attempt++) {
+            try {
+                io.restassured.specification.RequestSpecification request = RestAssured.given()
+                        .accept("*/*")
+                        .contentType("application/json")
+                        .body(json);
+                if (token != null) {
+                    request.header("Authorization", "Bearer " + token);
+                }
+                Response response = request
+                        .when()
+                        .post(url)
+                        .andReturn();
+                if (response.statusCode() >= 200 && response.statusCode() <= 300) {
+                    return response;
+                }
+                if (attempt == REQUEST_MAX_ATTEMPTS) {
+                    return response;
+                }
+                System.out.println("Request failed with status " + response.statusCode() + ", retrying...");
+            } catch (RuntimeException e) {
+                if (attempt == REQUEST_MAX_ATTEMPTS) {
+                    throw e;
+                }
+                System.out.println("Request error: " + e.getMessage() + ", retrying...");
             }
-            return request
-                    .when()
-                    .post(url)
-                    .andReturn();
-        });
+            sleepWithInterruptHandling(REQUEST_RETRY_DELAY.toMillis());
+        }
+        throw new IllegalStateException("Request retries exhausted");
+    }
+
+    private static void sleepWithInterruptHandling(long sleepMillis) {
+        try {
+            Thread.sleep(sleepMillis);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("Thread interrupted while waiting", e);
+        }
     }
 
     private static void assertSuccessful(Response response, String action) {

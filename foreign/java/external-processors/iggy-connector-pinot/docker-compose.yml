@@ -63,7 +63,7 @@ services:
 
   # Apache Pinot Controller
   pinot-controller:
-    image: apachepinot/pinot:latest
+    image: apachepinot/pinot:1.4.0
     container_name: pinot-controller
     command: "StartController -zkAddress zookeeper:2181"
     ports:
@@ -80,14 +80,14 @@ services:
       start_period: 30s
     volumes:
       - ./build/libs:/opt/pinot/plugins/pinot-stream-ingestion/iggy-connector
-      - ../../java-sdk/build/libs/iggy-0.6.0.jar:/opt/pinot/plugins/pinot-stream-ingestion/iggy-connector/iggy-0.6.0.jar
+      - ../../java-sdk/build/libs/iggy-0.6.2-SNAPSHOT.jar:/opt/pinot/plugins/pinot-stream-ingestion/iggy-connector/iggy-0.6.2-SNAPSHOT.jar
       - ./deployment:/opt/pinot/deployment
     networks:
       - iggy-pinot-network
 
   # Apache Pinot Broker
   pinot-broker:
-    image: apachepinot/pinot:latest
+    image: apachepinot/pinot:1.4.0
     container_name: pinot-broker
     command: "StartBroker -zkAddress zookeeper:2181"
     ports:
@@ -107,7 +107,7 @@ services:
 
   # Apache Pinot Server
   pinot-server:
-    image: apachepinot/pinot:latest
+    image: apachepinot/pinot:1.4.0
     container_name: pinot-server
     command: "StartServer -zkAddress zookeeper:2181"
     ports:
@@ -125,7 +125,7 @@ services:
       start_period: 30s
     volumes:
       - ./build/libs:/opt/pinot/plugins/pinot-stream-ingestion/iggy-connector
-      - ../../java-sdk/build/libs/iggy-0.6.0.jar:/opt/pinot/plugins/pinot-stream-ingestion/iggy-connector/iggy-0.6.0.jar
+      - ../../java-sdk/build/libs/iggy-0.6.2-SNAPSHOT.jar:/opt/pinot/plugins/pinot-stream-ingestion/iggy-connector/iggy-0.6.2-SNAPSHOT.jar
       - ./deployment:/opt/pinot/deployment
     networks:
       - iggy-pinot-network
