@@ -19,11 +19,17 @@
 
 package org.apache.iggy.connector.pinot.integration;
 
+import dev.failsafe.Failsafe;
+import dev.failsafe.RetryPolicy;
+import io.restassured.RestAssured;
+import io.restassured.response.Response;
+import org.awaitility.core.ConditionTimeoutException;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.MethodOrderer;
 import org.junit.jupiter.api.Order;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestMethodOrder;
+import org.testcontainers.containers.ContainerState;
 import org.testcontainers.containers.DockerComposeContainer;
 import org.testcontainers.containers.wait.strategy.Wait;
 import org.testcontainers.junit.jupiter.Container;
@@ -31,19 +37,19 @@ import org.testcontainers.junit.jupiter.Testcontainers;
 
 import java.io.File;
 import java.io.IOException;
-import java.net.URI;
-import java.net.http.HttpClient;
-import java.net.http.HttpRequest;
-import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
+import java.util.Arrays;
 import java.util.Base64;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
+import java.util.Optional;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.awaitility.Awaitility.await;
 
 @Testcontainers
 @TestMethodOrder(MethodOrderer.OrderAnnotation.class)
@@ -54,12 +60,22 @@ class IggyPinotIntegrationTest {
     private static final int PINOT_CONTROLLER_PORT = 9000;
     private static final int PINOT_BROKER_PORT = 8099;
     private static final int PINOT_SERVER_ADMIN_PORT = 8097;
-    private static final Duration REQUEST_TIMEOUT = Duration.ofSeconds(30);
+    private static final String SERVICE_IGGY = "iggy";
+    private static final String SERVICE_ZOOKEEPER = "zookeeper";
+    private static final String SERVICE_PINOT_CONTROLLER = "pinot-controller";
+    private static final String SERVICE_PINOT_BROKER = "pinot-broker";
+    private static final String SERVICE_PINOT_SERVER = "pinot-server";
     private static final Duration INGESTION_TIMEOUT = Duration.ofMinutes(2);
     private static final Duration POLL_INTERVAL = Duration.ofSeconds(2);
-    private static final Pattern COUNT_PATTERN = Pattern.compile("\"rows\"\\s*:\\s*\\[\\s*\\[\\s*(\\d+)");
+    private static final int MESSAGES_TO_SEND = 10;
+    private static final int LOG_TAIL_LINES = 80;
+    private static final RetryPolicy<Response> RETRY_POLICY = RetryPolicy.<Response>builder()
+            .handle(RuntimeException.class)
+            .handleResultIf(response -> response.statusCode() < 200 || response.statusCode() > 300)
+            .withDelay(Duration.ofSeconds(2))
+            .withMaxAttempts(3)
+            .build();
 
-    private static HttpClient client;
     private static String iggyUrl;
     private static String controllerUrl;
     private static String brokerUrl;
@@ -69,34 +85,39 @@ class IggyPinotIntegrationTest {
     @Container
     static final DockerComposeContainer<?> environment =
             new DockerComposeContainer<>(new File("docker-compose.test.yml"))
-                    .withServices("iggy", "zookeeper", "pinot-controller", "pinot-broker", "pinot-server")
+                    .withServices(
+                            SERVICE_IGGY,
+                            SERVICE_ZOOKEEPER,
+                            SERVICE_PINOT_CONTROLLER,
+                            SERVICE_PINOT_BROKER,
+                            SERVICE_PINOT_SERVER)
                     .withExposedService(
-                            "iggy",
+                            SERVICE_IGGY,
                             IGGY_HTTP_PORT,
                             Wait.forHttp("/")
                                     .forPort(IGGY_HTTP_PORT)
                                     .forStatusCode(200)
                                     .withStartupTimeout(Duration.ofMinutes(3)))
                     .withExposedService(
-                            "zookeeper",
+                            SERVICE_ZOOKEEPER,
                             ZOOKEEPER_PORT,
                             Wait.forListeningPort().withStartupTimeout(Duration.ofMinutes(3)))
                     .withExposedService(
-                            "pinot-controller",
+                            SERVICE_PINOT_CONTROLLER,
                             PINOT_CONTROLLER_PORT,
                             Wait.forHttp("/health")
                                     .forPort(PINOT_CONTROLLER_PORT)
                                     .forStatusCode(200)
                                     .withStartupTimeout(Duration.ofMinutes(3)))
                     .withExposedService(
-                            "pinot-broker",
+                            SERVICE_PINOT_BROKER,
                             PINOT_BROKER_PORT,
                             Wait.forHttp("/health")
                                     .forPort(PINOT_BROKER_PORT)
                                     .forStatusCode(200)
                                     .withStartupTimeout(Duration.ofMinutes(3)))
                     .withExposedService(
-                            "pinot-server",
+                            SERVICE_PINOT_SERVER,
                             PINOT_SERVER_ADMIN_PORT,
                             Wait.forHttp("/health")
                                     .forPort(PINOT_SERVER_ADMIN_PORT)
@@ -105,14 +126,10 @@ class IggyPinotIntegrationTest {
 
     @BeforeAll
     static void init() {
-        client = HttpClient.newBuilder()
-                .connectTimeout(Duration.ofSeconds(10))
-                .version(HttpClient.Version.HTTP_1_1)
-                .build();
-        iggyUrl = baseUrl("iggy", IGGY_HTTP_PORT);
-        controllerUrl = baseUrl("pinot-controller", PINOT_CONTROLLER_PORT);
-        brokerUrl = baseUrl("pinot-broker", PINOT_BROKER_PORT);
-        serverUrl = baseUrl("pinot-server", PINOT_SERVER_ADMIN_PORT);
+        iggyUrl = baseUrl(SERVICE_IGGY, IGGY_HTTP_PORT);
+        controllerUrl = baseUrl(SERVICE_PINOT_CONTROLLER, PINOT_CONTROLLER_PORT);
+        brokerUrl = baseUrl(SERVICE_PINOT_BROKER, PINOT_BROKER_PORT);
+        serverUrl = baseUrl(SERVICE_PINOT_SERVER, PINOT_SERVER_ADMIN_PORT);
     }
 
     @Test
@@ -123,107 +140,102 @@ class IggyPinotIntegrationTest {
         System.out.println("Pinot Controller: " + controllerUrl);
         System.out.println("Pinot Broker: " + brokerUrl);
         System.out.println("Pinot Server: " + serverUrl);
-        assertThat(httpStatus(client, iggyUrl + "/")).isEqualTo(200);
-        assertThat(httpStatus(client, controllerUrl + "/health")).isEqualTo(200);
-        assertThat(httpStatus(client, brokerUrl + "/health")).isEqualTo(200);
-        assertThat(httpStatus(client, serverUrl + "/health")).isEqualTo(200);
+        assertThat(get(iggyUrl + "/").statusCode()).isEqualTo(200);
+        assertThat(get(controllerUrl + "/health").statusCode()).isEqualTo(200);
+        assertThat(get(brokerUrl + "/health").statusCode()).isEqualTo(200);
+        assertThat(get(serverUrl + "/health").statusCode()).isEqualTo(200);
     }
 
     @Test
     @Order(2)
-    void step2_loginToIggy() throws Exception {
+    void step2_loginToIggy() {
         System.out.println("Step 2: Login to Iggy");
-        HttpResponse<String> loginResponse = postJson(
-                client,
+        Response loginResponse = postJson(
                 iggyUrl + "/users/login",
                 "{\"username\":\"iggy\",\"password\":\"iggy\"}",
                 null);
         System.out.println("Login response: " + loginResponse.statusCode());
-        System.out.println(loginResponse.body());
-        assertThat(loginResponse.statusCode()).isBetween(200, 299);
-        token = extractToken(loginResponse.body());
-        assertThat(token).isNotBlank();
+        System.out.println(loginResponse.asString());
+        assertSuccessful(loginResponse, "Login to Iggy");
+        token = extractToken(loginResponse);
     }
 
     @Test
     @Order(3)
-    void step3_createStream() throws Exception {
+    void step3_createStream() {
         System.out.println("Step 3: Create stream");
-        HttpResponse<String> streamResponse = postJson(
-                client,
+        Response streamResponse = postJson(
                 iggyUrl + "/streams",
                 "{\"stream_id\":1,\"name\":\"test-stream\"}",
                 token);
         System.out.println("Create stream response: " + streamResponse.statusCode());
-        System.out.println(streamResponse.body());
-        assertThat(streamResponse.statusCode()).isBetween(200, 299);
+        System.out.println(streamResponse.asString());
+        assertSuccessful(streamResponse, "Create stream");
     }
 
     @Test
     @Order(4)
-    void step4_createTopic() throws Exception {
+    void step4_createTopic() {
         System.out.println("Step 4: Create topic");
-        HttpResponse<String> topicResponse = postJson(
-                client,
+        Response topicResponse = postJson(
                 iggyUrl + "/streams/test-stream/topics",
                 "{\"topic_id\":1,\"name\":\"test-events\",\"partitions_count\":2,"
                         + "\"compression_algorithm\":\"none\",\"message_expiry\":0,\"max_topic_size\":0}",
                 token);
         System.out.println("Create topic response: " + topicResponse.statusCode());
-        System.out.println(topicResponse.body());
-        assertThat(topicResponse.statusCode()).isBetween(200, 299);
+        System.out.println(topicResponse.asString());
+        assertSuccessful(topicResponse, "Create topic");
     }
 
     @Test
     @Order(5)
-    void step5_createConsumerGroup() throws Exception {
+    void step5_createConsumerGroup() {
         System.out.println("Step 5: Create consumer group");
-        HttpResponse<String> groupResponse = postJson(
-                client,
+        Response groupResponse = postJson(
                 iggyUrl + "/streams/test-stream/topics/test-events/consumer-groups",
                 "{\"name\":\"pinot-integration-test\"}",
                 token);
         System.out.println("Create consumer group response: " + groupResponse.statusCode());
-        System.out.println(groupResponse.body());
-        assertThat(groupResponse.statusCode()).isBetween(200, 299);
+        System.out.println(groupResponse.asString());
+        assertSuccessful(groupResponse, "Create consumer group");
     }
 
     @Test
     @Order(6)
-    void step6_createSchema() throws Exception {
-        System.out.println("Step 6: Create schema");
-        String schemaJson = Files.readString(resolvePath("deployment/schema.json"), StandardCharsets.UTF_8);
-        HttpResponse<String> schemaResponse = postJson(
-                client,
-                controllerUrl + "/schemas",
-                schemaJson,
-                null);
-        System.out.println("Create schema response: " + schemaResponse.statusCode());
-        System.out.println(schemaResponse.body());
-        assertThat(schemaResponse.statusCode()).isBetween(200, 299);
+    void step6_ensurePinotTenants() throws Exception {
+        System.out.println("Step 6: Ensure Pinot tenants");
+        assertTenantAdded("BROKER");
+        assertTenantAdded("SERVER");
     }
 
     @Test
     @Order(7)
-    void step7_createTable() throws Exception {
-        System.out.println("Step 7: Create table");
-        String tableJson = Files.readString(resolvePath("deployment/table.json"), StandardCharsets.UTF_8);
-        HttpResponse<String> tableResponse = postJson(
-                client,
-                controllerUrl + "/tables",
-                tableJson,
-                null);
-        System.out.println("Create table response: " + tableResponse.statusCode());
-        System.out.println(tableResponse.body());
-        assertThat(tableResponse.statusCode()).isBetween(200, 299);
+    void step7_createSchema() throws Exception {
+        System.out.println("Step 7: Create schema");
+        String schemaJson = Files.readString(resolvePath("deployment/schema.json"), StandardCharsets.UTF_8);
+        Response schemaResponse = postJson(controllerUrl + "/schemas", schemaJson, null);
+        System.out.println("Create schema response: " + schemaResponse.statusCode());
+        System.out.println(schemaResponse.asString());
+        assertSuccessful(schemaResponse, "Create schema");
     }
 
     @Test
     @Order(8)
-    void step8_sendMessages() throws Exception {
-        System.out.println("Step 8: Send messages");
+    void step8_createTable() throws Exception {
+        System.out.println("Step 8: Create table");
+        String tableJson = Files.readString(resolvePath("deployment/table.json"), StandardCharsets.UTF_8);
+        Response tableResponse = postJson(controllerUrl + "/tables", tableJson, null);
+        System.out.println("Create table response: " + tableResponse.statusCode());
+        System.out.println(tableResponse.asString());
+        assertSuccessful(tableResponse, "Create table");
+    }
+
+    @Test
+    @Order(9)
+    void step9_sendMessages() {
+        System.out.println("Step 9: Send messages");
         String partitionValue = Base64.getEncoder().encodeToString(new byte[] {0, 0, 0, 0});
-        for (int i = 1; i <= 10; i++) {
+        for (int i = 1; i <= MESSAGES_TO_SEND; i++) {
             long timestamp = System.currentTimeMillis();
             String payloadJson = "{"
                     + "\"userId\":\"user" + i + "\","
@@ -232,45 +244,53 @@ class IggyPinotIntegrationTest {
                     + "\"duration\":" + (i * 100) + ","
                     + "\"timestamp\":" + timestamp
                     + "}";
-            String payload = Base64.getEncoder()
-                    .encodeToString(payloadJson.getBytes(StandardCharsets.UTF_8));
+            String payload = Base64.getEncoder().encodeToString(payloadJson.getBytes(StandardCharsets.UTF_8));
             String body = "{\"partitioning\":{\"kind\":\"partition_id\",\"value\":\"" + partitionValue + "\"},"
                     + "\"messages\":[{\"payload\":\"" + payload + "\"}]}";
-            HttpResponse<String> sendResponse = postJson(
-                    client,
+            Response sendResponse = postJson(
                     iggyUrl + "/streams/test-stream/topics/test-events/messages",
                     body,
                     token);
             System.out.println("Send message " + i + " response: " + sendResponse.statusCode());
-            System.out.println(sendResponse.body());
-            assertThat(sendResponse.statusCode()).isBetween(200, 299);
+            System.out.println(sendResponse.asString());
+            assertSuccessful(sendResponse, "Send message " + i);
         }
     }
 
     @Test
-    @Order(9)
-    void step9_pollPinotForIngestion() throws Exception {
-        System.out.println("Step 9: Poll Pinot for ingestion");
+    @Order(10)
+    void step10_pollPinotForIngestion() {
+        System.out.println("Step 10: Poll Pinot for ingestion");
         String queryBody = "{\"sql\":\"SELECT COUNT(*) FROM test_events_REALTIME\"}";
-        long deadline = System.currentTimeMillis() + INGESTION_TIMEOUT.toMillis();
-        long count = -1;
+        AtomicLong count = new AtomicLong(-1);
+        AtomicInteger lastStatus = new AtomicInteger(-1);
+        AtomicReference<String> lastQueryResponse = new AtomicReference<>("");
 
-        while (System.currentTimeMillis() < deadline) {
-            HttpResponse<String> response = postJson(client, brokerUrl + "/query/sql", queryBody, null);
-            System.out.println("Query response: " + response.statusCode());
-            System.out.println(response.body());
-            if (response.statusCode() >= 200 && response.statusCode() < 300) {
-                count = extractCount(response.body());
-                if (count > 0) {
-                    break;
-                }
-            }
-            Thread.sleep(POLL_INTERVAL.toMillis());
+        try {
+            await()
+                    .atMost(INGESTION_TIMEOUT)
+                    .pollInterval(POLL_INTERVAL)
+                    .until(() -> {
+                        Response response = postJson(brokerUrl + "/query/sql", queryBody, null);
+                        lastStatus.set(response.statusCode());
+                        String body = response.asString();
+                        lastQueryResponse.set(body);
+                        System.out.println("Query response: " + response.statusCode());
+                        System.out.println(body);
+                        if (response.statusCode() >= 200 && response.statusCode() < 300) {
+                            count.set(extractCount(response));
+                        }
+                        return count.get() >= MESSAGES_TO_SEND;
+                    });
+        } catch (ConditionTimeoutException e) {
+            throw new AssertionError(
+                    "Expected at least " + MESSAGES_TO_SEND + " ingested rows, but got " + count.get()
+                            + ", lastStatus=" + lastStatus.get()
+                            + ", lastQueryResponse=" + lastQueryResponse.get()
+                            + System.lineSeparator()
+                            + diagnosticLogs(),
+                    e);
         }
-
-        assertThat(count)
-                .withFailMessage("No rows ingested within timeout")
-                .isGreaterThan(0);
     }
 
     private static String baseUrl(String service, int port) {
@@ -279,18 +299,12 @@ class IggyPinotIntegrationTest {
         return "http://" + host + ":" + mappedPort;
     }
 
-    private static int httpStatus(HttpClient client, String url) {
-        try {
-            HttpRequest request = HttpRequest.newBuilder()
-                    .uri(URI.create(url))
-                    .timeout(Duration.ofSeconds(10))
-                    .GET()
-                    .build();
-            HttpResponse<Void> response = client.send(request, HttpResponse.BodyHandlers.discarding());
-            return response.statusCode();
-        } catch (Exception e) {
-            throw new RuntimeException("HTTP request failed for " + url, e);
-        }
+    private static Response get(String url) {
+        return RestAssured.given()
+                .accept("*/*")
+                .when()
+                .get(url)
+                .andReturn();
     }
 
     private static Path resolvePath(String relativePath) throws IOException {
@@ -305,69 +319,102 @@ class IggyPinotIntegrationTest {
         throw new IOException("File not found: " + relativePath);
     }
 
-    private static HttpResponse<String> postJson(
-            HttpClient client,
-            String url,
-            String json,
-            String token) throws Exception {
-        int maxAttempts = 3;
-        byte[] body = json.getBytes(StandardCharsets.UTF_8);
-        for (int attempt = 1; attempt <= maxAttempts; attempt++) {
-            try {
-                HttpRequest.Builder builder = HttpRequest.newBuilder()
-                        .uri(URI.create(url))
-                        .timeout(REQUEST_TIMEOUT)
-                        .header("Accept", "*/*")
-                        .header("Content-Type", "application/json")
-                        .POST(HttpRequest.BodyPublishers.ofByteArray(body));
-                if (token != null) {
-                    builder.header("Authorization", "Bearer " + token);
-                }
-                HttpResponse<String> response = client.send(builder.build(), HttpResponse.BodyHandlers.ofString());
-                if (!shouldRetry(response.statusCode()) || attempt == maxAttempts) {
-                    return response;
-                }
-                System.out.println("Request failed with status " + response.statusCode() + ", retrying...");
-            } catch (IOException | InterruptedException e) {
-                if (e instanceof InterruptedException) {
-                    Thread.currentThread().interrupt();
-                }
-                if (attempt == maxAttempts) {
-                    throw e;
-                }
-                System.out.println("Request error: " + e.getMessage() + ", retrying...");
+    private static Response postJson(String url, String json, String token) {
+        return Failsafe.with(RETRY_POLICY).get(() -> {
+            io.restassured.specification.RequestSpecification request = RestAssured.given()
+                    .accept("*/*")
+                    .contentType("application/json")
+                    .body(json);
+            if (token != null) {
+                request.header("Authorization", "Bearer " + token);
             }
-            Thread.sleep(2000);
-        }
-        throw new IllegalStateException("Request retries exhausted");
+            return request
+                    .when()
+                    .post(url)
+                    .andReturn();
+        });
     }
 
-    private static boolean shouldRetry(int status) {
-        return status == 408 || status == 429 || status >= 500;
+    private static void assertSuccessful(Response response, String action) {
+        assertThat(response.statusCode())
+                .withFailMessage("%s failed, status=%s, body=%s", action, response.statusCode(), response.asString())
+                .isBetween(200, 299);
     }
 
-    private static String extractToken(String body) {
-        int idx = body.indexOf("\"token\":\"");
-        if (idx < 0) {
-            throw new IllegalStateException("Token not found in login response");
-        }
-        int start = idx + "\"token\":\"".length();
-        int end = body.indexOf("\"", start);
-        if (end < 0) {
-            throw new IllegalStateException("Token not terminated in login response");
-        }
-        return body.substring(start, end);
+    private static void assertTenantAdded(String role) throws Exception {
+        org.testcontainers.containers.Container.ExecResult result = findContainer(SERVICE_PINOT_CONTROLLER)
+                .execInContainer(
+                        "bin/pinot-admin.sh",
+                        "AddTenant",
+                        "-name", "DefaultTenant",
+                        "-role", role,
+                        "-instanceCount", "1",
+                        "-controllerHost", "localhost",
+                        "-controllerPort", "9000");
+        assertThat(result.getExitCode())
+                .withFailMessage(
+                        "AddTenant failed for role=%s%nstdout:%n%s%nstderr:%n%s",
+                        role,
+                        result.getStdout(),
+                        result.getStderr())
+                .isEqualTo(0);
     }
 
-    private static long extractCount(String body) {
-        Matcher matcher = COUNT_PATTERN.matcher(body);
-        if (!matcher.find()) {
-            return -1;
+    private static ContainerState findContainer(String serviceName) {
+        Optional<ContainerState> byInstance = environment.getContainerByServiceName(serviceName + "_1");
+        if (byInstance.isPresent()) {
+            return byInstance.get();
         }
+        return environment.getContainerByServiceName(serviceName)
+                .orElseThrow(() -> new IllegalStateException(
+                        "Container not found for service=" + serviceName));
+    }
+
+    private static String diagnosticLogs() {
+        return "=== iggy logs ===\n" + tailLogs(SERVICE_IGGY)
+                + "\n=== pinot-controller logs ===\n" + tailLogs(SERVICE_PINOT_CONTROLLER)
+                + "\n=== pinot-broker logs ===\n" + tailLogs(SERVICE_PINOT_BROKER)
+                + "\n=== pinot-server logs ===\n" + tailLogs(SERVICE_PINOT_SERVER);
+    }
+
+    private static String tailLogs(String serviceName) {
         try {
-            return Long.parseLong(matcher.group(1));
-        } catch (NumberFormatException ignored) {
-            return -1;
+            String logs = findContainer(serviceName).getLogs();
+            return tail(logs, LOG_TAIL_LINES);
+        } catch (Exception e) {
+            return "Failed to read logs for " + serviceName + ": " + e.getMessage();
         }
+    }
+
+    private static String tail(String logs, int maxLines) {
+        String[] lines = logs.split("\\R");
+        int from = Math.max(0, lines.length - maxLines);
+        return String.join(System.lineSeparator(), Arrays.copyOfRange(lines, from, lines.length));
+    }
+
+    private static String extractToken(Response loginResponse) {
+        String extracted = loginResponse.jsonPath().getString("access_token.token");
+        if (extracted == null || extracted.isBlank()) {
+            extracted = loginResponse.jsonPath().getString("token");
+        }
+        assertThat(extracted)
+                .withFailMessage("Token not found in login response: %s", loginResponse.asString())
+                .isNotBlank();
+        return extracted;
+    }
+
+    private static long extractCount(Response response) {
+        Object value = response.jsonPath().get("resultTable.rows[0][0]");
+        if (value instanceof Number) {
+            return ((Number) value).longValue();
+        }
+        if (value instanceof String) {
+            try {
+                return Long.parseLong((String) value);
+            } catch (NumberFormatException ignored) {
+                return -1;
+            }
+        }
+        return -1;
     }
 }
