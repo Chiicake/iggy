@@ -73,7 +73,7 @@ class IggyPinotIntegrationTest {
 
     @Container
     static final DockerComposeContainer<?> environment =
-            new DockerComposeContainer<>(new File("docker-compose.test.yml"))
+            new DockerComposeContainer<>(new File("docker-compose.yml"))
                     .withServices(
                             SERVICE_IGGY,
                             SERVICE_ZOOKEEPER,

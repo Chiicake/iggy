@@ -44,9 +44,7 @@ logback = "1.5.21"
 junit = "6.0.1"
 assertj = "3.27.6"
 testcontainers = "2.0.2"
-awaitility = "4.3.0"
 restassured = "5.5.6"
-failsafe = "3.3.2"
 
 # Netty
 netty = "4.2.7.Final"
@@ -99,9 +97,7 @@ junit-platform-launcher = { module = "org.junit.platform:junit-platform-launcher
 assertj-core = { module = "org.assertj:assertj-core", version.ref = "assertj" }
 testcontainers = { module = "org.testcontainers:testcontainers", version.ref = "testcontainers" }
 testcontainers-junit = { module = "org.testcontainers:testcontainers-junit-jupiter", version.ref = "testcontainers" }
-awaitility = { module = "org.awaitility:awaitility", version.ref = "awaitility" }
 restassured = { module = "io.rest-assured:rest-assured", version.ref = "restassured" }
-failsafe = { module = "dev.failsafe:failsafe", version.ref = "failsafe" }
 
 # Netty
 netty-dns-macos = { module = "io.netty:netty-resolver-dns-native-macos", version.ref = "netty" }

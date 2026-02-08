@@ -19,7 +19,6 @@ services:
   # Apache Iggy Server (from official Apache repo)
   iggy:
     image: apache/iggy:latest
-    container_name: iggy-server
     ports:
       - "8090:8090"  # TCP
       - "3000:3000"  # HTTP
@@ -52,7 +51,6 @@ services:
   # Zookeeper (required by Pinot)
   zookeeper:
     image: zookeeper:3.9
-    container_name: pinot-zookeeper
     ports:
       - "2181:2181"
     environment:
@@ -64,7 +62,6 @@ services:
   # Apache Pinot Controller
   pinot-controller:
     image: apachepinot/pinot:1.4.0
-    container_name: pinot-controller
     command: "StartController -zkAddress zookeeper:2181"
     ports:
       - "9000:9000"
@@ -88,7 +85,6 @@ services:
   # Apache Pinot Broker
   pinot-broker:
     image: apachepinot/pinot:1.4.0
-    container_name: pinot-broker
     command: "StartBroker -zkAddress zookeeper:2181"
     ports:
       - "8099:8099"
@@ -108,7 +104,6 @@ services:
   # Apache Pinot Server
   pinot-server:
     image: apachepinot/pinot:1.4.0
-    container_name: pinot-server
     command: "StartServer -zkAddress zookeeper:2181"
     ports:
       - "8098:8098"
